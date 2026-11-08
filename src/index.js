@@ -36,7 +36,7 @@ function cookies(req) {
   return out;
 }
 function setCookie(name, value, maxAge) {
-  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
+  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
 }
 
 async function currentUser(env, req) {
@@ -147,7 +147,7 @@ async function discordCallback(env, req) {
     status: 302,
     headers: {
       location: '/',
-      'set-cookie': `${setCookie('gh_session', sess, 2592000)}, gh_oauth_state=; Path=/; Max-Age=0`,
+      'set-cookie': `${setCookie('gh_session', sess, 2592000)}, gh_oauth_state=; Path=/; HttpOnly; Secure; Max-Age=0`,
     },
   });
 }
@@ -155,7 +155,7 @@ async function discordCallback(env, req) {
 async function logout(env, req) {
   const sess = cookies(req).gh_session;
   if (sess) await env.DB.prepare(`DELETE FROM sessions WHERE token_hash = ?`).bind(await sha256hex(sess)).run();
-  return new Response(null, { status: 302, headers: { location: '/', 'set-cookie': 'gh_session=; Path=/; Max-Age=0' } });
+  return new Response(null, { status: 302, headers: { location: '/', 'set-cookie': 'gh_session=; Path=/; HttpOnly; Secure; Max-Age=0' } });
 }
 
 // ---------- API ----------
@@ -194,9 +194,10 @@ async function api(env, req, url, user) {
       return json({ error: 'repo already exists' }, 409);
     }
     // seed README
+    const readme = `# ${name}\n\n${desc}\n`;
     await env.DB.prepare(`INSERT INTO files (repo_id, path, content, size)
       SELECT id, 'README.md', ?, ? FROM repos WHERE owner_id = ? AND name = ?`)
-      .bind(`# ${name}\n\n${desc}\n`, 0, user.id, name).run();
+      .bind(readme, readme.length, user.id, name).run();
     const repo = await repoByName(env, user.username, name);
     return json({ repo: { ...repo, owner: user.username } }, 201);
   }
@@ -225,9 +226,10 @@ async function api(env, req, url, user) {
       const body = await req.json().catch(() => null);
       const writes = Array.isArray(body?.files) ? body.files : body?.path != null ? [{ path: body.path, content: body.content }] : null;
       if (!writes || !writes.length) return json({ error: 'files[] required' }, 400);
+      if (writes.length > 50) return json({ error: 'too many files (max 50 per commit)' }, 400);
       const stmts = [];
       let total = 0;
-      for (const f of writes.slice(0, 50)) {
+      for (const f of writes) {
         const fp = String(f.path || '').replace(/^\/+|\/+$/g, '');
         if (!fp || fp.length > 400 || fp.includes('..')) return json({ error: `bad path: ${fp}` }, 400);
         const content = String(f.content ?? '');
@@ -269,10 +271,14 @@ async function api(env, req, url, user) {
       return json(row);
     }
 
-    // delete repo (owner)
+    // delete repo (owner) — cascade files + commits
     if (!rest && m === 'DELETE') {
       if (!isOwner) return json({ error: 'forbidden' }, 403);
-      await env.DB.prepare(`DELETE FROM repos WHERE id = ?`).bind(repo.id).run();
+      await env.DB.batch([
+        env.DB.prepare(`DELETE FROM files WHERE repo_id = ?`).bind(repo.id),
+        env.DB.prepare(`DELETE FROM commits WHERE repo_id = ?`).bind(repo.id),
+        env.DB.prepare(`DELETE FROM repos WHERE id = ?`).bind(repo.id),
+      ]);
       return json({ ok: true });
     }
   }
@@ -323,21 +329,32 @@ async function loadstring(env, req, url) {
   });
 }
 
+const SEC_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'strict-origin-when-cross-origin',
+  'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://cdn.discordapp.com data:; connect-src 'self'; frame-ancestors 'none'",
+};
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     try {
-      if (url.pathname.startsWith('/api/auth/discord')) return discordAuthorizeUrl(env, req);
-      if (url.pathname === '/api/auth/callback') return discordCallback(env, req);
-      if (url.pathname === '/api/auth/logout') return logout(env, req);
-      if (url.pathname.startsWith('/loadstring/')) return loadstring(env, req, url);
-      if (url.pathname.startsWith('/api/')) {
+      let res;
+      if (url.pathname.startsWith('/api/auth/discord')) res = discordAuthorizeUrl(env, req);
+      else if (url.pathname === '/api/auth/callback') res = discordCallback(env, req);
+      else if (url.pathname === '/api/auth/logout') res = logout(env, req);
+      else if (url.pathname.startsWith('/loadstring/')) res = await loadstring(env, req, url);
+      else if (url.pathname.startsWith('/api/')) {
         const user = await currentUser(env, req);
-        return api(env, req, url, user);
-      }
-      return env.ASSETS.fetch(req);
+        res = await api(env, req, url, user);
+      } else res = await env.ASSETS.fetch(req);
+      const out = new Response(res.body, res);
+      for (const [k, v] of Object.entries(SEC_HEADERS)) out.headers.set(k, v);
+      return out;
     } catch (e) {
-      return json({ error: 'internal', detail: String(e?.message || e) }, 500);
+      console.error('worker error:', e);
+      return json({ error: 'internal' }, 500);
     }
   },
 };
